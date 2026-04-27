@@ -1,0 +1,56 @@
+esphome:
+  name: test
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [sen0575, as5048b]
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+
+as5048b:
+  address: 0x40
+  update_interval: 10s
+  offset: 0
+  direction_levels: 16
+  invert: false
+
+sensor:
+  - platform: sen0575
+    address: 0x1D
+    update_interval: 10s
+    rain_accumulated_value: 0.2794
+    rainfall:
+      name: "Cumulative Rainfall"
+    rainfall_hour:
+      name: "Rainfall (last 1h)"
+      hour: 1
+    raw_data:
+      name: "Tipping Bucket Count"
+    working_time:
+      name: "Sensor Working Time"
+
+  - platform: as5048b
+    angle:
+      name: "Wind Direction Angle"
+    raw_angle:
+      name: "Wind Direction Raw"
+    magnitude:
+      name: "Magnetic Field Magnitude"
+    gain:
+      name: "AS5048B AGC"
+
+text_sensor:
+  - platform: as5048b
+    direction:
+      name: "Wind Direction"
