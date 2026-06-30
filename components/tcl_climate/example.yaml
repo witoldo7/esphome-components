@@ -1,0 +1,163 @@
+# Example config for the TCL climate component.
+#
+# Two independent feature sets are shown:
+#   1. Control entities (swing / sleep / preset selects, beep / display / eco /
+#      8°C switches) — wired to the climate via *_select / *_switch config keys.
+#   2. External-sensor proportional thermostat — activates automatically as soon
+#      as `ext_temp_sensor` is set. It computes a virtual target so the AC
+#      modulates against a real Home Assistant room sensor instead of its own
+#      coarse internal sensor:  sent = internal_temp + user_target - external_temp
+#
+# The custom thermostat only regulates in COOL and HEAT modes. The user's UI
+# setpoint is never overwritten by the regulation code.
+
+esphome:
+  name: tcl-ac
+  friendly_name: TCL AC
+
+esp8266:
+  board: esp07
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [tcl_climate]
+
+logger:
+  baud_rate: 0            # UART is used for the AC, keep serial logging off
+
+wifi:
+  ssid: "your-ssid"       # replace (or use !secret wifi_ssid)
+  password: "your-pass"   # replace (or use !secret wifi_password)
+
+api:                      # required by the homeassistant sensors below
+uart:
+  id: uart_bus
+  tx_pin: GPIO15
+  rx_pin: GPIO13
+  baud_rate: 9600
+  parity: EVEN
+
+sensor:
+  # External temperature sensor(s) from Home Assistant, used for regulation:
+  - platform: homeassistant
+    id: ext_temp
+    entity_id: sensor.your_room_temperature
+  - platform: homeassistant
+    id: ext_temp_2                       # optional (fallback / average)
+    entity_id: sensor.your_second_temperature
+  # Optional: power draw from a smart plug, mirrored to a component sensor:
+  - platform: homeassistant
+    id: ac_power_watt
+    entity_id: sensor.your_ac_power
+
+climate:
+  - platform: tcl_climate
+    id: tcl_ac
+    uart_id: uart_bus
+    name: "TCL AC"
+
+    # ── Control entities ──────────────────────────────────────────────────
+    # Note: Eco / Sleep / 8°C are ALSO exposed as native HA climate presets
+    # (Eco, Sleep, Away, plus custom "Sleep Elderly" / "Sleep Young") — they
+    # appear in the climate card's preset dropdown automatically, no config
+    # needed. The switches/select below stay in sync and remain optional.
+    vswing_select: vswing
+    hswing_select: hswing
+    sleep_select: sleep_sel
+    preset_select: preset_sel
+    beep_switch: beep_sw
+    display_switch: display_sw
+    eco_switch: eco_sw
+    8deg_switch: deg8_sw
+
+    # ── External-sensor regulation (proportional thermostat) ──────────────
+    ext_temp_sensor: ext_temp
+    ext_temp_sensor_2: ext_temp_2        # optional
+    power_sensor: ac_power_watt          # optional
+    fallback_temperature: 23             # used until the user sets a target
+    regulation_interval: 30s             # min interval between auto commands
+    ext_temp_method: "Primary"           # Primary | Primary with fallback | Average
+
+    # Sensors published back to Home Assistant (all optional):
+    internal_temp:
+      name: "Temperature Int"            # AC's own coarse reading (debug)
+    ext_temp:
+      name: "Temperature Ext1"           # external sensor #1 value
+    ext_temp_2:
+      name: "Temperature Ext2"           # external sensor #2 value
+    sent_temp:
+      name: "Temperature Cmd"            # computed target sent to the AC
+    power:
+      name: "AC Power"
+
+select:
+  - platform: template
+    name: "Vertical swing"
+    id: vswing
+    entity_category: config
+    optimistic: true
+    options: ["Last position", "Fix top", "Fix upper", "Fix mid", "Fix lower",
+              "Fix bottom", "Move full", "Move upper", "Move lower"]
+    set_action:
+      lambda: 'id(tcl_ac).control_vertical_swing(x);'
+
+  - platform: template
+    name: "Horizontal swing"
+    id: hswing
+    entity_category: config
+    optimistic: true
+    options: ["Last position", "Fix left", "Fix mid left", "Fix mid",
+              "Fix mid right", "Fix right", "Move full", "Move left",
+              "Move mid", "Move right"]
+    set_action:
+      lambda: 'id(tcl_ac).control_horizontal_swing(x);'
+
+  - platform: template
+    name: "Sleep mode"
+    id: sleep_sel
+    entity_category: config
+    optimistic: true
+    options: ["Off", "Default", "Elderly", "Young"]
+    set_action:
+      lambda: 'id(tcl_ac).control_sleep_mode(x);'
+
+  - platform: template
+    name: "Preset"
+    id: preset_sel
+    entity_category: config
+    optimistic: true
+    options: ["Normal", "Turbo", "Mute"]
+
+  # Runtime-selectable external temperature method:
+  - platform: template
+    name: "External Temp Method"
+    id: ext_temp_method
+    entity_category: config
+    optimistic: true
+    options: ["Primary", "Primary with fallback", "Average"]
+    set_action:
+      lambda: 'id(tcl_ac).set_ext_temp_method(x);'
+
+switch:
+  - platform: template
+    name: "AC Beeper"
+    id: beep_sw
+    entity_category: config
+    optimistic: true
+  - platform: template
+    name: "AC Display"
+    id: display_sw
+    entity_category: config
+    optimistic: true
+  - platform: template
+    name: "AC Eco"
+    id: eco_sw
+    entity_category: config
+    optimistic: true
+  - platform: template
+    name: "AC 8°C Heater"
+    id: deg8_sw
+    entity_category: config
+    optimistic: true

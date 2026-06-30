@@ -6,6 +6,7 @@
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/select/select.h"
 #include "esphome/components/switch/switch.h"
+#include "esphome/components/sensor/sensor.h"
 
 namespace esphome {
 namespace tcl_climate {
@@ -23,17 +24,34 @@ class TCLClimate : public climate::Climate, public uart::UARTDevice, public Poll
   std::string hswing_pos = "";
   std::string vswing_pos = "";
 
-  // ── Select-Widget-Setter ──────────────────────────────────────────────────
+  // ── Select setters ──────────────────────────────────────────────────
   void set_vswing_select(select::Select *sel) { this->vswing_select_ = sel; }
   void set_hswing_select(select::Select *sel) { this->hswing_select_ = sel; }
   void set_sleep_select(select::Select *sel)  { this->sleep_select_  = sel; }
   void set_preset_select(select::Select *sel) { this->preset_select_ = sel; }
 
-  // ── Switch-Setter ─────────────────────────────────────────────────────────
+  // ── Switch setters ─────────────────────────────────────────────────────────
   void set_beep_switch(switch_::Switch *sw)    { this->beep_switch_    = sw; }
   void set_display_switch(switch_::Switch *sw) { this->display_switch_ = sw; }
   void set_eco_switch(switch_::Switch *sw)     { this->eco_switch_     = sw; }
   void set_8deg_switch(switch_::Switch *sw)    { this->deg8_switch_    = sw; }
+
+  // ── External sensor regulation (proportional thermostat) ───────────────────
+  // Input sensors (from Home Assistant):
+  void set_ext_temp_sensor(sensor::Sensor *s)   { this->ext_temp_sensor_   = s; }
+  void set_ext_temp_sensor_2(sensor::Sensor *s) { this->ext_temp_sensor_2_ = s; }
+  void set_power_sensor(sensor::Sensor *s)      { this->power_sensor_      = s; }
+  // Output sensors (published to Home Assistant):
+  void set_int_temp_output(sensor::Sensor *s)   { this->int_temp_output_   = s; }
+  void set_ext_temp_output(sensor::Sensor *s)   { this->ext_temp_output_   = s; }
+  void set_ext_temp_2_output(sensor::Sensor *s) { this->ext_temp_2_output_ = s; }
+  void set_power_output(sensor::Sensor *s)      { this->power_output_      = s; }
+  void set_sent_temp_output(sensor::Sensor *s)  { this->sent_temp_output_  = s; }
+  // Configuration:
+  void set_fallback_temperature(float t)        { this->fallback_temperature_ = t; }
+  void set_regulation_interval(uint32_t ms)     { this->regulation_interval_ms_ = ms; }
+  void set_ext_temp_method(const std::string &method) { this->ext_temp_method_ = method; }
+  const std::string &get_ext_temp_method() const { return this->ext_temp_method_; }
 
   union get_cmd_resp_t {
     struct {
@@ -211,15 +229,15 @@ class TCLClimate : public climate::Climate, public uart::UARTDevice, public Poll
 
   bool ready_to_send_set_cmd_flag = false;
 
-  // Interne Zustände für die neuen Features
-  bool beep_enabled_    = false;  // Beep nur auf expliziten Wunsch
+  // Internal state for the extra features
+  bool beep_enabled_    = false;  // beep only on explicit request
   bool display_enabled_ = true;
   bool eco_enabled_     = false;
   bool deg8_enabled_    = false;
   uint8_t sleep_mode_   = 0x00;  // 0=off, 1=default, 2=elderly, 3=young
 
-  // Temperatur-Debounce: nach einem gesendeten Befehl ignoriert loop()
-  // AC-Poll-Werte fuer die Temperatur fuer TEMP_DEBOUNCE_MS Millisekunden.
+  // Temperature debounce: after a sent command, loop() ignores the AC's
+  // polled temperature value for TEMP_DEBOUNCE_MS milliseconds.
   uint32_t temp_cmd_sent_ms_ = 0;
   static constexpr uint32_t TEMP_DEBOUNCE_MS = 3000;
 
@@ -262,6 +280,38 @@ class TCLClimate : public climate::Climate, public uart::UARTDevice, public Poll
   int read_data_line(int readch, uint8_t *buffer, int len);
   bool is_valid_xor(uint8_t *buffer, int len);
   void print_hex_str(uint8_t *buffer, int len);
+
+  // External sensor regulation
+  bool regulation_enabled() const { return this->ext_temp_sensor_ != nullptr; }
+  bool can_send_regulation();
+  void run_regulation(float curr_temp, float ext_temp);
+
+  // HA climate presets: Eco / Sleep / 8°C (Away) and sleep sub-modes
+  void apply_preset(climate::ClimatePreset preset);
+  void apply_custom_preset(const std::string &custom_preset);
+  void sync_feature_entities();   // align eco/8°C switch + sleep select with internal state
+  void update_preset_state();     // derive this->preset / custom_preset from internal state
+
+  sensor::Sensor *ext_temp_sensor_{nullptr};
+  sensor::Sensor *ext_temp_sensor_2_{nullptr};
+  sensor::Sensor *power_sensor_{nullptr};
+  sensor::Sensor *int_temp_output_{nullptr};
+  sensor::Sensor *ext_temp_output_{nullptr};
+  sensor::Sensor *ext_temp_2_output_{nullptr};
+  sensor::Sensor *power_output_{nullptr};
+  sensor::Sensor *sent_temp_output_{nullptr};
+
+  float fallback_temperature_{23.0f};
+  float last_sent_temp_{0.0f};
+  uint32_t last_regulation_send_ms_{0};
+  uint32_t regulation_interval_ms_{30000};
+  std::string ext_temp_method_{"Primary"};
+  bool user_has_set_target_{false};
+
+  // When active, build_set_cmd uses reg_sent_temp_ instead of target_temperature,
+  // without overwriting the user's UI setpoint.
+  bool  reg_temp_override_{false};
+  float reg_sent_temp_{0.0f};
 
   select::Select *vswing_select_{nullptr};
   select::Select *hswing_select_{nullptr};

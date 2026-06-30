@@ -2,6 +2,7 @@
 #include "esphome/core/helpers.h"
 #include "tcl_climate.h"
 #include <map>
+#include <cmath>
 
 namespace esphome {
 namespace tcl_climate {
@@ -11,7 +12,7 @@ static constexpr int MAX_LINE_LENGTH = 100;
 static constexpr int UPDATE_INTERVAL_MS = 450;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// State-Setter (erkennen Änderungen, setzen is_changed für publish_state)
+// State setters (detect changes, set is_changed for publish_state)
 // ─────────────────────────────────────────────────────────────────────────────
 
 void TCLClimate::set_current_temperature(float current_temperature) {
@@ -38,7 +39,7 @@ void TCLClimate::set_mode(climate::ClimateMode mode) {
     case climate::CLIMATE_MODE_HEAT:     mode_str = "HEAT";     break;
     case climate::CLIMATE_MODE_FAN_ONLY: mode_str = "FAN ONLY"; break;
     case climate::CLIMATE_MODE_DRY:      mode_str = "DRY";      break;
-    case climate::CLIMATE_MODE_AUTO:     mode_str = "AUTO";     break;
+    case climate::CLIMATE_MODE_HEAT_COOL: mode_str = "HEAT_COOL"; break;
     default:                             mode_str = "UNKNOWN";  break;
   }
   ESP_LOGI("TCL", "Climate mode changed to: %s", mode_str);
@@ -85,7 +86,7 @@ void TCLClimate::set_vswing_pos(const std::string &pos) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// build_set_cmd: Wandelt get_cmd_resp_t (AC-State) in das Set-Kommando um
+// build_set_cmd: converts get_cmd_resp_t (AC state) into the set command
 // ─────────────────────────────────────────────────────────────────────────────
 
 void TCLClimate::build_set_cmd(get_cmd_resp_t *get_cmd_resp) {
@@ -95,17 +96,17 @@ void TCLClimate::build_set_cmd(get_cmd_resp_t *get_cmd_resp) {
   m_set_cmd.data.off_timer_en = 0;
   m_set_cmd.data.on_timer_en  = 0;
 
-  // Neue Features: Beep, Display, Eco aus internen Zuständen
+  // Beep, display, eco from internal state
   m_set_cmd.data.beep      = beep_enabled_    ? 1 : 0;
   m_set_cmd.data.disp      = display_enabled_ ? 1 : 0;
   m_set_cmd.data.eco       = eco_enabled_     ? 1 : 0;
   m_set_cmd.data.turbo     = get_cmd_resp->data.turbo;
   m_set_cmd.data.mute      = get_cmd_resp->data.mute;
 
-  // 8°-Heizung
+  // 8°C heater
   m_set_cmd.data.heater_8deg = deg8_enabled_ ? 1 : 0;
 
-  // Sleep-Modus (Bits[6:7] in Byte 19)
+  // Sleep mode (bits[6:7] in byte 19)
   m_set_cmd.data.sleep_mode = sleep_mode_;
 
   static constexpr uint8_t MODE_MAP[] = {
@@ -119,8 +120,10 @@ void TCLClimate::build_set_cmd(get_cmd_resp_t *get_cmd_resp) {
   if (get_cmd_resp->data.mode < sizeof(MODE_MAP))
     m_set_cmd.data.mode = MODE_MAP[get_cmd_resp->data.mode];
 
-  // Temperatur: Im Set-Command ist temp ebenfalls invertiert kodiert: temp = 31 - T
-  float target = this->target_temperature;
+  // Temperature: in the set command temp is inverted too: temp = 31 - T
+  // When external regulation is active, use the computed send value without
+  // changing the user's UI setpoint (target_temperature).
+  float target = this->reg_temp_override_ ? this->reg_sent_temp_ : this->target_temperature;
   uint8_t temp_int  = static_cast<uint8_t>(target);
   bool    half_deg  = (target - temp_int) >= 0.4f;
   m_set_cmd.data.temp        = 31 - temp_int;
@@ -137,7 +140,7 @@ void TCLClimate::build_set_cmd(get_cmd_resp_t *get_cmd_resp) {
   if (get_cmd_resp->data.fan < sizeof(FAN_MAP))
     m_set_cmd.data.fan = FAN_MAP[get_cmd_resp->data.fan];
 
-  // Vertikaler Schwenk
+  // Vertical swing
   if (get_cmd_resp->data.vswing_mv) {
     m_set_cmd.data.vswing     = 0x07;
     m_set_cmd.data.vswing_fix = 0;
@@ -152,7 +155,7 @@ void TCLClimate::build_set_cmd(get_cmd_resp_t *get_cmd_resp) {
     m_set_cmd.data.vswing_mv  = 0;
   }
 
-  // Horizontaler Schwenk
+  // Horizontal swing
   if (get_cmd_resp->data.hswing_mv) {
     m_set_cmd.data.hswing     = 0x01;
     m_set_cmd.data.hswing_fix = 0;
@@ -167,7 +170,7 @@ void TCLClimate::build_set_cmd(get_cmd_resp_t *get_cmd_resp) {
     m_set_cmd.data.hswing_mv  = 0;
   }
 
-  // XOR-Checksumme
+  // XOR checksum
   uint8_t xor_byte = 0;
   for (size_t i = 0; i < sizeof(m_set_cmd.raw) - 1; i++)
     xor_byte ^= m_set_cmd.raw[i];
@@ -181,19 +184,21 @@ void TCLClimate::build_set_cmd(get_cmd_resp_t *get_cmd_resp) {
 void TCLClimate::setup() {
   set_update_interval(UPDATE_INTERVAL_MS);
   this->set_supported_custom_fan_modes({"Turbo", "Mute", "Automatic", "1", "2", "3", "4", "5"});
+  // Custom presets must be registered on the entity (traits version is deprecated)
+  this->set_supported_custom_presets({"Sleep Elderly", "Sleep Young"});
 
-  // ── Select-Callbacks ──────────────────────────────────────────────────────
+  // ── Select callbacks ──────────────────────────────────────────────────────
   if (this->vswing_select_ != nullptr) {
     this->vswing_select_->add_on_state_callback([this](uint32_t) {
       const std::string &val = this->vswing_select_->current_option();
-      if (val == this->vswing_pos) return;  // keine Änderung gegenüber AC-State
+      if (val == this->vswing_pos) return;  // no change vs AC state
       this->control_vertical_swing(val);
     });
   }
   if (this->hswing_select_ != nullptr) {
     this->hswing_select_->add_on_state_callback([this](uint32_t) {
       const std::string &val = this->hswing_select_->current_option();
-      if (val == this->hswing_pos) return;  // keine Änderung gegenüber AC-State
+      if (val == this->hswing_pos) return;  // no change vs AC state
       this->control_horizontal_swing(val);
     });
   }
@@ -204,19 +209,19 @@ void TCLClimate::setup() {
       if      (val == "Default") new_mode = 0x01;
       else if (val == "Elderly") new_mode = 0x02;
       else if (val == "Young")   new_mode = 0x03;
-      if (new_mode == sleep_mode_) return;  // keine Änderung
+      if (new_mode == sleep_mode_) return;  // no change
       this->control_sleep_mode(val);
     });
   }
   if (this->preset_select_ != nullptr) {
     this->preset_select_->add_on_state_callback([this](uint32_t) {
-      // Guard: nur senden wenn der Wert sich gegenüber dem AC-State wirklich geändert hat
+      // Guard: only send when the value actually changed vs the AC state
       const std::string &val = this->preset_select_->current_option();
       bool ac_turbo = (m_get_cmd_resp.data.turbo == 1);
       bool ac_mute  = (m_get_cmd_resp.data.mute  == 1);
       bool want_turbo = (val == "Turbo");
       bool want_mute  = (val == "Mute");
-      if (want_turbo == ac_turbo && want_mute == ac_mute) return;  // keine Änderung
+      if (want_turbo == ac_turbo && want_mute == ac_mute) return;  // no change
       get_cmd_resp_t gcr = {0};
       memcpy(gcr.raw, m_get_cmd_resp.raw, sizeof(gcr.raw));
       gcr.data.turbo = want_turbo ? 1 : 0;
@@ -227,7 +232,7 @@ void TCLClimate::setup() {
     });
   }
 
-  // ── Switch-Callbacks ──────────────────────────────────────────────────────
+  // ── Switch callbacks ──────────────────────────────────────────────────────
   if (this->beep_switch_ != nullptr) {
     this->beep_switch_->add_on_state_callback([this](bool state) {
       if (state == beep_enabled_) return;
@@ -267,7 +272,7 @@ void TCLClimate::setup() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Lamellen- und Sleep-Direktsteuerung
+// Direct louver and sleep control
 // ─────────────────────────────────────────────────────────────────────────────
 
 void TCLClimate::control_vertical_swing(const std::string &swing_mode) {
@@ -322,7 +327,162 @@ void TCLClimate::control_sleep_mode(const std::string &mode) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// control() – von HA aufgerufen
+// External sensor regulation (proportional thermostat)
+//
+// Instead of sending the user setpoint to the AC, a virtual setpoint is
+// computed so the AC modulates proportionally to the real room temperature:
+//   sent = internal_temp + user_target - external_temp
+// The AC then sees gap = internal - sent = external - user_target and drives
+// its compressor RPM proportionally to the deviation from the target.
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool TCLClimate::can_send_regulation() {
+  uint32_t now = millis();
+  if (now - last_regulation_send_ms_ < regulation_interval_ms_) return false;
+  last_regulation_send_ms_ = now;
+  return true;
+}
+
+void TCLClimate::run_regulation(float curr_temp, float ext_temp) {
+  float target = this->target_temperature;
+
+  // Sends a regulation command with the computed temperature without changing
+  // the UI setpoint (target_temperature).
+  auto send_reg = [this](float sent_temp, uint8_t ac_mode) {
+    this->m_get_cmd_resp.data.power = 0x01;
+    this->m_get_cmd_resp.data.mode  = ac_mode;
+    this->reg_sent_temp_     = sent_temp;
+    this->reg_temp_override_ = true;
+    this->build_set_cmd(&this->m_get_cmd_resp);
+    this->reg_temp_override_ = false;
+    this->ready_to_send_set_cmd_flag = true;
+  };
+
+  // Temperature field currently reported by the AC (displayed - 16) and half-degree bit
+  uint8_t cur_field = m_get_cmd_resp.data.temp;
+  bool    cur_half  = (m_get_cmd_resp.data.half_degree == 1);
+
+  if (this->mode == climate::CLIMATE_MODE_COOL) {
+    if (ext_temp > target) {
+      float sent = curr_temp + target - ext_temp;
+      if (sent < 16.0f) sent = 16.0f;
+      if (sent > 30.0f) sent = 30.0f;
+      last_sent_temp_ = sent;
+      uint8_t field  = static_cast<uint8_t>(floorf(sent)) - 16;
+      bool want_half = (sent - floorf(sent)) >= 0.4f;
+      if ((cur_field != field || cur_half != want_half || m_get_cmd_resp.data.power == 0) && can_send_regulation()) {
+        send_reg(sent, 0x01);
+        ESP_LOGD("TCL", "Cool reg: ext=%.1f int=%.1f tgt=%.1f -> sent=%.1f", ext_temp, curr_temp, target, sent);
+      }
+    } else {
+      // Setpoint reached: send the highest value so the AC stops cooling
+      last_sent_temp_ = 31.0f;
+      if (cur_field != 15 && can_send_regulation()) {
+        send_reg(31.0f, 0x01);
+        ESP_LOGD("TCL", "Cool reg: ext=%.1f <= tgt=%.1f -> stop", ext_temp, target);
+      }
+    }
+  } else if (this->mode == climate::CLIMATE_MODE_HEAT) {
+    if (ext_temp < target) {
+      float sent = curr_temp + target - ext_temp;
+      if (sent < 16.0f) sent = 16.0f;
+      if (sent > 30.0f) sent = 30.0f;
+      last_sent_temp_ = sent;
+      uint8_t field  = static_cast<uint8_t>(floorf(sent)) - 16;
+      bool want_half = (sent - floorf(sent)) >= 0.4f;
+      if ((cur_field != field || cur_half != want_half || m_get_cmd_resp.data.power == 0) && can_send_regulation()) {
+        send_reg(sent, 0x04);
+        ESP_LOGD("TCL", "Heat reg: ext=%.1f int=%.1f tgt=%.1f -> sent=%.1f", ext_temp, curr_temp, target, sent);
+      }
+    } else {
+      // Setpoint reached: send the lowest value so the AC stops heating
+      last_sent_temp_ = 16.0f;
+      if (cur_field != 0 && can_send_regulation()) {
+        send_reg(16.0f, 0x04);
+        ESP_LOGD("TCL", "Heat reg: ext=%.1f >= tgt=%.1f -> stop", ext_temp, target);
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HA climate presets  (Eco / Sleep / 8°C heater)
+//
+// Native presets:  ECO -> eco bit, SLEEP -> sleep mode 0x01, AWAY -> 8°C heater
+// Custom presets:  "Sleep Elderly" -> 0x02, "Sleep Young" -> 0x03
+// The legacy entities (eco_switch/8deg_switch/sleep_select) stay usable and
+// are kept in sync with the preset state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+void TCLClimate::apply_preset(climate::ClimatePreset preset) {
+  switch (preset) {
+    case climate::CLIMATE_PRESET_ECO:   eco_enabled_ = true;  deg8_enabled_ = false; sleep_mode_ = 0x00; break;
+    case climate::CLIMATE_PRESET_SLEEP: eco_enabled_ = false; deg8_enabled_ = false; sleep_mode_ = 0x01; break;
+    case climate::CLIMATE_PRESET_AWAY:  eco_enabled_ = false; deg8_enabled_ = true;  sleep_mode_ = 0x00; break;
+    case climate::CLIMATE_PRESET_NONE:
+    default:                            eco_enabled_ = false; deg8_enabled_ = false; sleep_mode_ = 0x00; break;
+  }
+  this->preset = preset;
+  this->clear_custom_preset_();
+  this->sync_feature_entities();
+}
+
+void TCLClimate::apply_custom_preset(const std::string &custom_preset) {
+  eco_enabled_ = false;
+  deg8_enabled_ = false;
+  if      (custom_preset == "Sleep Elderly") sleep_mode_ = 0x02;
+  else if (custom_preset == "Sleep Young")   sleep_mode_ = 0x03;
+  else                                       sleep_mode_ = 0x00;
+  this->set_custom_preset_(custom_preset.c_str());
+  this->preset.reset();
+  this->sync_feature_entities();
+}
+
+void TCLClimate::sync_feature_entities() {
+  // Push the internal state onto the legacy control entities. Their callbacks
+  // bail out on an unchanged value, so no extra command is generated.
+  if (this->eco_switch_ != nullptr && this->eco_switch_->state != eco_enabled_)
+    this->eco_switch_->publish_state(eco_enabled_);
+  if (this->deg8_switch_ != nullptr && this->deg8_switch_->state != deg8_enabled_)
+    this->deg8_switch_->publish_state(deg8_enabled_);
+  if (this->sleep_select_ != nullptr) {
+    const char *opt = (sleep_mode_ == 0x01) ? "Default"
+                    : (sleep_mode_ == 0x02) ? "Elderly"
+                    : (sleep_mode_ == 0x03) ? "Young"
+                                            : "Off";
+    if (this->sleep_select_->current_option() != opt)
+      this->sleep_select_->publish_state(opt);
+  }
+}
+
+void TCLClimate::update_preset_state() {
+  // Derive the preset to display from the internal state (priority:
+  // sleep sub-modes > Sleep > 8°C > Eco > no preset).
+  climate::ClimatePreset np = climate::CLIMATE_PRESET_NONE;
+  const char *nc = nullptr;
+  if      (sleep_mode_ == 0x02) nc = "Sleep Elderly";
+  else if (sleep_mode_ == 0x03) nc = "Sleep Young";
+  else if (sleep_mode_ == 0x01) np = climate::CLIMATE_PRESET_SLEEP;
+  else if (deg8_enabled_)       np = climate::CLIMATE_PRESET_AWAY;
+  else if (eco_enabled_)        np = climate::CLIMATE_PRESET_ECO;
+
+  if (nc != nullptr) {
+    if (!this->has_custom_preset() || this->get_custom_preset() != nc) {
+      this->set_custom_preset_(nc);
+      this->preset.reset();
+      this->is_changed = true;
+    }
+  } else {
+    if (this->has_custom_preset() || !this->preset.has_value() || this->preset.value() != np) {
+      this->preset = np;
+      this->clear_custom_preset_();
+      this->is_changed = true;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// control() - called by HA
 // ─────────────────────────────────────────────────────────────────────────────
 
 void TCLClimate::control(const climate::ClimateCall &call) {
@@ -340,9 +500,8 @@ void TCLClimate::control(const climate::ClimateCall &call) {
         case climate::CLIMATE_MODE_COOL:      gcr.data.mode = 0x01; break;
         case climate::CLIMATE_MODE_DRY:       gcr.data.mode = 0x03; break;
         case climate::CLIMATE_MODE_FAN_ONLY:  gcr.data.mode = 0x02; break;
-        case climate::CLIMATE_MODE_HEAT:
-        case climate::CLIMATE_MODE_HEAT_COOL: gcr.data.mode = 0x04; break;
-        case climate::CLIMATE_MODE_AUTO:      gcr.data.mode = 0x05; break;
+        case climate::CLIMATE_MODE_HEAT:      gcr.data.mode = 0x04; break;
+        case climate::CLIMATE_MODE_HEAT_COOL: gcr.data.mode = 0x05; break;
         default: break;
       }
     }
@@ -352,11 +511,17 @@ void TCLClimate::control(const climate::ClimateCall &call) {
   if (call.get_target_temperature().has_value()) {
     float temp = *call.get_target_temperature();
     this->target_temperature = temp;
-    // AC antwortet mit temp = T - 16 (direkt, nicht invertiert)
-    uint8_t temp_int = static_cast<uint8_t>(temp);
-    m_get_cmd_resp.data.temp = (temp_int - 16) & 0x0F;
-    temp_cmd_sent_ms_ = millis();
-    should_build = true;
+    this->user_has_set_target_ = true;
+    if (this->regulation_enabled()) {
+      // With external regulation, loop() computes the value actually sent;
+      // the user setpoint is only stored, not sent to the AC directly.
+    } else {
+      // AC replies with temp = T - 16 (direct, not inverted)
+      uint8_t temp_int = static_cast<uint8_t>(temp);
+      m_get_cmd_resp.data.temp = (temp_int - 16) & 0x0F;
+      temp_cmd_sent_ms_ = millis();
+      should_build = true;
+    }
   }
 
   if (call.get_swing_mode().has_value()) {
@@ -402,6 +567,17 @@ void TCLClimate::control(const climate::ClimateCall &call) {
     should_build = true;
   }
 
+  // Presets (Eco / Sleep / 8°C). apply_* sets eco_enabled_/deg8_enabled_/
+  // sleep_mode_, which build_set_cmd then writes into the command.
+  if (call.get_preset().has_value()) {
+    this->apply_preset(*call.get_preset());
+    should_build = true;
+  }
+  if (call.has_custom_preset()) {
+    this->apply_custom_preset(std::string(call.get_custom_preset().c_str()));
+    should_build = true;
+  }
+
   if (should_build) {
     build_set_cmd(&gcr);
     ready_to_send_set_cmd_flag = true;
@@ -421,7 +597,7 @@ climate::ClimateTraits TCLClimate::traits() {
     climate::CLIMATE_MODE_HEAT,
     climate::CLIMATE_MODE_FAN_ONLY,
     climate::CLIMATE_MODE_DRY,
-    climate::CLIMATE_MODE_AUTO
+    climate::CLIMATE_MODE_HEAT_COOL
   });
   if (!this->custom_swing_modes_.empty()) {
     for (auto mode : this->custom_swing_modes_) {
@@ -434,14 +610,21 @@ climate::ClimateTraits TCLClimate::traits() {
     traits.add_supported_swing_mode(climate::CLIMATE_SWING_HORIZONTAL);
     traits.add_supported_swing_mode(climate::CLIMATE_SWING_BOTH);
   }
+  // Presets: Eco / Sleep / 8°C (Away) native, sleep sub-modes as custom presets
+  traits.set_supported_presets({
+    climate::CLIMATE_PRESET_NONE,
+    climate::CLIMATE_PRESET_ECO,
+    climate::CLIMATE_PRESET_SLEEP,
+    climate::CLIMATE_PRESET_AWAY,
+  });
   traits.set_visual_min_temperature(16.0);
   traits.set_visual_max_temperature(31.0);
-  traits.set_visual_target_temperature_step(1.0);  // Gerät unterstützt keine 0.5°C Schritte
+  traits.set_visual_target_temperature_step(1.0);  // device does not support 0.5°C steps
   return traits;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// update() – periodisch
+// update() - periodic
 // ─────────────────────────────────────────────────────────────────────────────
 
 void TCLClimate::update() {
@@ -454,7 +637,7 @@ void TCLClimate::update() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// UART-Hilfsfunktionen
+// UART helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 int TCLClimate::read_data_line(int readch, uint8_t *buffer, int len) {
@@ -495,7 +678,7 @@ void TCLClimate::print_hex_str(uint8_t *buffer, int len) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// loop() – UART empfangen und State auswerten
+// loop() - receive UART and evaluate state
 // ─────────────────────────────────────────────────────────────────────────────
 
 void TCLClimate::loop() {
@@ -511,23 +694,23 @@ void TCLClimate::loop() {
 
         float curr_temp = ((static_cast<uint16_t>(buffer[17] << 8) | buffer[18]) / 374.0f - 32.0f) / 1.8f;
 
-        // Debounce: Solange ein eigener Temperaturbefehl kürzlich gesendet wurde,
-        // den AC-Rückgabewert für die Temperatur NICHT in m_get_cmd_resp übernehmen.
-        // Alle anderen Felder (Mode, Fan, Swing...) werden immer übernommen.
+        // Debounce: while we recently sent our own temperature command, do NOT
+        // take the AC's returned temperature into m_get_cmd_resp.
+        // All other fields (mode, fan, swing...) are always taken over.
         bool temp_settled = (millis() - temp_cmd_sent_ms_) > TEMP_DEBOUNCE_MS;
         if (temp_settled) {
           memcpy(m_get_cmd_resp.raw, buffer, len);
         } else {
-          // temp sitzt in raw[8] Bits[3:0] – dieses Nibble sichern,
-          // alle anderen Felder (Mode, Fan, Swing...) aus der AC-Antwort übernehmen.
-          uint8_t saved_temp_nibble = m_get_cmd_resp.raw[8] & 0x0F;  // temp[3:0] sichern
+          // temp lives in raw[8] bits[3:0] - keep that nibble,
+          // take all other fields (mode, fan, swing...) from the AC reply.
+          uint8_t saved_temp_nibble = m_get_cmd_resp.raw[8] & 0x0F;  // keep temp[3:0]
           memcpy(m_get_cmd_resp.raw, buffer, len);
-          m_get_cmd_resp.raw[8] = (buffer[8] & 0xF0) | saved_temp_nibble;  // fan-Nibble aus AC, temp aus uns
+          m_get_cmd_resp.raw[8] = (buffer[8] & 0xF0) | saved_temp_nibble;  // fan nibble from AC, temp from us
         }
 
         this->is_changed = false;
 
-        // ── Betriebsmodus ────────────────────────────────────────────────────
+        // ── Operating mode ────────────────────────────────────────────────────
         if (m_get_cmd_resp.data.power == 0x00) {
           this->set_mode(climate::CLIMATE_MODE_OFF);
         } else {
@@ -536,13 +719,13 @@ void TCLClimate::loop() {
             {0x03, climate::CLIMATE_MODE_DRY},
             {0x02, climate::CLIMATE_MODE_FAN_ONLY},
             {0x04, climate::CLIMATE_MODE_HEAT},
-            {0x05, climate::CLIMATE_MODE_AUTO}
+            {0x05, climate::CLIMATE_MODE_HEAT_COOL}
           };
           auto it = MODE_MAP.find(m_get_cmd_resp.data.mode);
           if (it != MODE_MAP.end()) this->set_mode(it->second);
         }
 
-        // ── Lüfter / Preset ───────────────────────────────────────────────────
+        // ── Fan / preset ───────────────────────────────────────────────────
         static const std::map<uint8_t, std::string> FAN_MAP = {
           {0x00, "Automatic"}, {0x01, "1"}, {0x04, "2"},
           {0x02, "3"},         {0x05, "4"}, {0x03, "5"}
@@ -566,21 +749,22 @@ void TCLClimate::loop() {
             this->preset_select_->publish_state("Normal");
         }
 
-        // ── Display-Switch rücksynchronisieren ───────────────────────────────
+        // ── Sync display switch back ───────────────────────────────
         bool disp_on = (m_get_cmd_resp.data.disp == 1);
         if (this->display_switch_ != nullptr && this->display_switch_->state != disp_on) {
           display_enabled_ = disp_on;
           this->display_switch_->publish_state(disp_on);
         }
 
-        // ── Eco-Switch rücksynchronisieren ───────────────────────────────────
+        // ── Take eco from the AC reply (switch and preset follow) ────────
+        // (Sleep mode and 8°C heater are not encoded in the AC reply, so they
+        //  are derived from the internal state only.)
         bool eco_on = (m_get_cmd_resp.data.eco == 1);
-        if (this->eco_switch_ != nullptr && this->eco_switch_->state != eco_on) {
-          eco_enabled_ = eco_on;
+        eco_enabled_ = eco_on;
+        if (this->eco_switch_ != nullptr && this->eco_switch_->state != eco_on)
           this->eco_switch_->publish_state(eco_on);
-        }
 
-        // ── Schwenkmodus ─────────────────────────────────────────────────────
+        // ── Swing mode ─────────────────────────────────────────────────────
         if      (m_get_cmd_resp.data.hswing && m_get_cmd_resp.data.vswing)
           this->set_swing_mode(climate::CLIMATE_SWING_BOTH);
         else if (!m_get_cmd_resp.data.hswing && !m_get_cmd_resp.data.vswing)
@@ -590,7 +774,7 @@ void TCLClimate::loop() {
         else
           this->set_swing_mode(climate::CLIMATE_SWING_HORIZONTAL);
 
-        // ── Vertikale Lamellenposition ────────────────────────────────────────
+        // ── Vertical louver position ────────────────────────────────────────
         if      (m_get_cmd_resp.data.vswing_mv == 0x01) set_vswing_pos("Move full");
         else if (m_get_cmd_resp.data.vswing_mv == 0x02) set_vswing_pos("Move upper");
         else if (m_get_cmd_resp.data.vswing_mv == 0x03) set_vswing_pos("Move lower");
@@ -601,7 +785,7 @@ void TCLClimate::loop() {
         else if (m_get_cmd_resp.data.vswing_fix == 0x05) set_vswing_pos("Fix bottom");
         else set_vswing_pos("Last position");
 
-        // ── Horizontale Lamellenposition ──────────────────────────────────────
+        // ── Horizontal louver position ──────────────────────────────────────
         if      (m_get_cmd_resp.data.hswing_mv == 0x01) set_hswing_pos("Move full");
         else if (m_get_cmd_resp.data.hswing_mv == 0x02) set_hswing_pos("Move left");
         else if (m_get_cmd_resp.data.hswing_mv == 0x03) set_hswing_pos("Move mid");
@@ -613,15 +797,65 @@ void TCLClimate::loop() {
         else if (m_get_cmd_resp.data.hswing_fix == 0x05) set_hswing_pos("Fix right");
         else set_hswing_pos("Last position");
 
-        this->set_current_temperature(curr_temp);
+        // ── Publish internal AC temperature (debug) ───────────────────
+        if (this->int_temp_output_ != nullptr)
+          this->int_temp_output_->publish_state(curr_temp);
 
-        // Zieltemperatur aus AC übernehmen.
-        // AC kodiert temp als T - 16 in der Antwort (direkt, nicht invertiert)
-        {
+        if (this->regulation_enabled()) {
+          // ── External sensor regulation ────────────────────────────────────────
+          // Determine the external reading per the selected method
+          float ext_temp = 0.0f;
+          bool  ext_ok   = false;
+          bool  s1 = this->ext_temp_sensor_->has_state();
+          bool  s2 = (this->ext_temp_sensor_2_ != nullptr) && this->ext_temp_sensor_2_->has_state();
+
+          if (this->ext_temp_method_ == "Average" && this->ext_temp_sensor_2_ != nullptr) {
+            if (s1 && s2) { ext_temp = (this->ext_temp_sensor_->get_state() + this->ext_temp_sensor_2_->get_state()) / 2.0f; ext_ok = true; }
+            else if (s1)  { ext_temp = this->ext_temp_sensor_->get_state();   ext_ok = true; }
+            else if (s2)  { ext_temp = this->ext_temp_sensor_2_->get_state(); ext_ok = true; }
+          } else if (this->ext_temp_method_ == "Primary with fallback" && this->ext_temp_sensor_2_ != nullptr) {
+            if (s1)      { ext_temp = this->ext_temp_sensor_->get_state();   ext_ok = true; }
+            else if (s2) { ext_temp = this->ext_temp_sensor_2_->get_state(); ext_ok = true; }
+          } else {
+            if (s1)      { ext_temp = this->ext_temp_sensor_->get_state();   ext_ok = true; }
+          }
+
+          // Initialize the setpoint if the user has not set one yet
+          if (!this->user_has_set_target_) {
+            this->set_target_temperature(this->fallback_temperature_);
+            this->user_has_set_target_ = true;
+          }
+
+          if (ext_ok) {
+            if (this->ext_temp_output_ != nullptr) this->ext_temp_output_->publish_state(ext_temp);
+            this->set_current_temperature(ext_temp);
+            this->run_regulation(curr_temp, ext_temp);
+          } else {
+            // No external reading available: fall back to the AC's internal reading
+            this->set_current_temperature(curr_temp);
+          }
+
+          if (this->ext_temp_2_output_ != nullptr && s2)
+            this->ext_temp_2_output_->publish_state(this->ext_temp_sensor_2_->get_state());
+          if (this->sent_temp_output_ != nullptr)
+            this->sent_temp_output_->publish_state(this->last_sent_temp_);
+        } else {
+          // ── Original behavior (no external regulation) ────────────────────
+          this->set_current_temperature(curr_temp);
+
+          // Take the target temperature from the AC.
+          // The AC encodes temp as T - 16 in the reply (direct, not inverted)
           float ac_target = static_cast<float>(m_get_cmd_resp.data.temp + 16);
           if (m_get_cmd_resp.data.half_degree) ac_target += 0.5f;
           this->set_target_temperature(ac_target);
         }
+
+        // ── Pass through power sensor (smart plug) ────────────────────────
+        if (this->power_sensor_ != nullptr && this->power_sensor_->has_state() && this->power_output_ != nullptr)
+          this->power_output_->publish_state(this->power_sensor_->get_state());
+
+        // ── Derive active preset from internal state ─────────────────────
+        this->update_preset_state();
 
         if (this->is_changed) this->publish_state();
       }
