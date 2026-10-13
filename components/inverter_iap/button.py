@@ -9,7 +9,7 @@ DEPENDENCIES = ["inverter_iap"]
 InverterIAPButton = inverter_iap_ns.class_("InverterIAPButton", button.Button)
 
 CONF_ACTION = "action"
-ACTIONS = {"update": 0, "abort": 1, "query": 2}
+ACTIONS = {"update": 0, "abort": 1, "query": 2, "reset": 3}
 
 CONFIG_SCHEMA = button.button_schema(InverterIAPButton).extend(
     {

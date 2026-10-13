@@ -214,6 +214,22 @@ void InverterIAP::abort_update() {
   this->fail_("przerwano przez uzytkownika");
 }
 
+void InverterIAP::reset_to_app() {
+  if (this->is_busy()) {
+    ESP_LOGW(TAG, "Zajety (faza %d) — nie wysylam resetu.", this->phase_);
+    return;
+  }
+  if (this->modbus_ != nullptr)
+    this->modbus_->disable_loop();
+  uint8_t b;
+  while (this->available())
+    this->read_byte(&b);
+  this->query_only_ = true;  // bez progress=100 w finish_
+  this->publish_status_("Reset do aplikacji...");
+  ESP_LOGI(TAG, "Wysylam Reset (0x05) -> wyjscie z bootloadera do aplikacji.");
+  this->enter_phase_(PH_RESET);
+}
+
 // --- cykl życia -------------------------------------------------------------
 void InverterIAP::setup() { this->publish_status_("Gotowy"); }
 
@@ -428,12 +444,24 @@ void InverterIAP::loop() {
     }
 
     case PH_RESET: {
-      uint16_t n = this->build_cmd_(f, 0x05);  // Reset
-      this->send_frame_(f, n);
-      this->send_frame_(f, n);
-      this->send_frame_(f, n);
-      this->finish_(this->query_only_ ? "Test lacznosci zakonczony (reset do aplikacji)."
-                                      : "Aktualizacja zakonczona. Falownik uruchamia nowy firmware.");
+      // Reset (0x05) wyzwala w bootloaderze reset watchdogiem -> skok do aplikacji.
+      // Wysyłamy POJEDYNCZE ramki z odstępem (nie zlepione), żeby bootloader je złapał
+      // zanim nastąpi reset. Po 1. zwykle urządzenie już się resetuje i milknie.
+      if (!this->req_sent_) {
+        uint16_t n = this->build_cmd_(f, 0x05);
+        this->send_frame_(f, n);
+        this->req_sent_ = true;
+        this->attempt_++;
+        this->phase_deadline_ms_ = millis() + 200;  // odstęp między ramkami
+        return;
+      }
+      if (millis() >= this->phase_deadline_ms_) {
+        if (this->attempt_ >= 3)
+          this->finish_(this->query_only_ ? "Reset do aplikacji wyslany (watchdog)."
+                                          : "Aktualizacja zakonczona. Falownik uruchamia nowy firmware.");
+        else
+          this->req_sent_ = false;  // kolejna ramka 0x05 z odstępem
+      }
       break;
     }
 

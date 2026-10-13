@@ -12,7 +12,8 @@ namespace inverter_iap {
 enum IapButtonAction : uint8_t {
   ACTION_UPDATE = 0,  // pełna aktualizacja (zapis tylko gdy allow_update: true)
   ACTION_ABORT = 1,   // przerwij trwającą aktualizację
-  ACTION_QUERY = 2,   // bezpieczny test łączności (QueryInfo + reset, bez zapisu)
+  ACTION_QUERY = 2,   // test łączności (QueryInfo) — UWAGA: wchodzi w bootloader
+  ACTION_RESET = 3,   // czysty Reset (0x05) — wyjście z bootloadera do aplikacji
 };
 
 class InverterIAPButton : public button::Button, public Parented<InverterIAP> {
@@ -27,6 +28,9 @@ class InverterIAPButton : public button::Button, public Parented<InverterIAP> {
         break;
       case ACTION_QUERY:
         this->parent_->start_update(true);
+        break;
+      case ACTION_RESET:
+        this->parent_->reset_to_app();
         break;
       case ACTION_UPDATE:
       default:

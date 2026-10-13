@@ -50,6 +50,8 @@ class InverterIAP : public Component, public uart::UARTDevice {
   // query_only == true: wejdź w bootloader, odczytaj QueryInfo i zresetuj (bez zapisu).
   void start_update(bool query_only);
   void abort_update();
+  // Wyślij czysty Reset (0x05) do bootloadera → powrót do aplikacji (bez flashowania).
+  void reset_to_app();
   bool is_busy() const { return this->phase_ != PH_IDLE && this->phase_ != PH_DONE && this->phase_ != PH_FAILED; }
 
  protected:
