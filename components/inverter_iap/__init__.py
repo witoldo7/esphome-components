@@ -128,16 +128,18 @@ def _build_blocks(words: dict):
     return blocks, flash_sum
 
 
-def _load_firmware(path: str):
-    with open(path, "rb") as f:
-        raw = f.read()
-    low = str(path).lower()
+def _is_url(value: str) -> bool:
+    return value.startswith("http://") or value.startswith("https://")
+
+
+def _load_firmware_bytes(raw: bytes, name: str):
+    low = name.split("?", 1)[0].lower()  # odetnij ewentualny query string z URL
     if low.endswith(".hex"):
         text = raw.decode("latin-1")
     elif low.endswith(".udt"):
         text = _decrypt_udt(raw).decode("latin-1")
     else:
-        raise cv.Invalid("firmware musi być plikiem .udt lub .hex")
+        raise cv.Invalid("firmware musi być plikiem/URL .udt lub .hex")
     words = _parse_intel_hex(text)
     if words.get(FLAG_ADDR) != FLAG_VALUE:
         got = words.get(FLAG_ADDR)
@@ -152,8 +154,10 @@ def _load_firmware(path: str):
     return blocks, flash_sum
 
 
-def _validate_firmware_path(value):
+def _validate_firmware(value):
     value = cv.string(value)
+    if _is_url(value):
+        return value  # URL pobierany przy kompilacji (z cache ESPHome)
     path = CORE.relative_config_path(value)
     try:
         with open(path, "rb"):
@@ -171,7 +175,7 @@ CONFIG_SCHEMA = (
         {
             cv.GenerateID(): cv.declare_id(InverterIAP),
             cv.Optional(CONF_ADDRESS, default=1): cv.int_range(min=1, max=247),
-            cv.Required(CONF_FIRMWARE): _validate_firmware_path,
+            cv.Required(CONF_FIRMWARE): _validate_firmware,
             cv.Optional(CONF_OBJECT, default="app"): cv.enum(OBJECTS, lower=True),
             cv.Optional(CONF_ALLOW_UPDATE, default=False): cv.boolean,
             cv.Optional(CONF_MODBUS_ID): cv.use_id(cg.Component),
@@ -216,8 +220,18 @@ async def to_code(config):
         cg.add(var.set_status_text_sensor(t))
 
     # --- osadzenie obrazu firmware we flash ESP32 ---
-    path = CORE.relative_config_path(config[CONF_FIRMWARE])
-    blocks, flash_sum = _load_firmware(path)
+    fw = config[CONF_FIRMWARE]
+    if _is_url(fw):
+        from esphome.external_files import compute_local_file_path, download_content
+
+        cache = compute_local_file_path("inverter_iap", fw)
+        raw = download_content(fw, cache)
+        blocks, flash_sum = _load_firmware_bytes(raw, fw)
+    else:
+        path = CORE.relative_config_path(fw)
+        with open(path, "rb") as f:
+            raw = f.read()
+        blocks, flash_sum = _load_firmware_bytes(raw, str(path))
 
     blob = bytearray()
     addrs = []
