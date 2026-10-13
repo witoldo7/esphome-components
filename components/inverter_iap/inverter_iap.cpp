@@ -36,8 +36,8 @@ uint16_t InverterIAP::build_enter_(uint8_t *out) const {
   out[2] = 0x23;  // StartCmdParam = 0x2300
   out[3] = 0x00;
   uint16_t crc = crc16_modbus_(out, 4);
-  out[4] = (crc >> 8) & 0xFF;  // hi przed lo (odwrotnie niż klasyczne RTU)
-  out[5] = crc & 0xFF;
+  out[4] = crc & 0xFF;         // młodszy bajt pierwszy — standardowy Modbus (jak IAPTool)
+  out[5] = (crc >> 8) & 0xFF;  // starszy bajt
   return 6;
 }
 
