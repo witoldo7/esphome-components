@@ -38,6 +38,7 @@ class InverterIAP : public Component, public uart::UARTDevice {
   void set_flow_control_pin(GPIOPin *pin) { this->flow_control_pin_ = pin; }
   void set_progress_sensor(sensor::Sensor *s) { this->progress_sensor_ = s; }
   void set_status_text_sensor(text_sensor::TextSensor *t) { this->status_text_sensor_ = t; }
+  void set_debug(bool debug) { this->debug_ = debug; }
   void set_firmware(const uint8_t *data, const uint32_t *addr, uint32_t blocks, uint32_t flash_sum) {
     this->fw_data_ = data;
     this->fw_addr_ = addr;
@@ -56,6 +57,7 @@ class InverterIAP : public Component, public uart::UARTDevice {
   void send_frame_(const uint8_t *buf, uint16_t len);
   void drain_rx_();
   bool frame_ready_() const;
+  void log_hex_(const char *dir, const uint8_t *buf, uint16_t len) const;
   static uint8_t pkt_chk_(const uint8_t *buf, uint16_t len);
   static uint16_t crc16_modbus_(const uint8_t *buf, uint16_t len);
   bool resp_chk_ok_() const;
@@ -78,6 +80,7 @@ class InverterIAP : public Component, public uart::UARTDevice {
   uint8_t address_{1};
   uint8_t object_{0};  // 0 = App, 1 = Boot
   bool allow_update_{false};
+  bool debug_{false};
   Component *modbus_{nullptr};
   GPIOPin *flow_control_pin_{nullptr};
   sensor::Sensor *progress_sensor_{nullptr};
@@ -98,10 +101,13 @@ class InverterIAP : public Component, public uart::UARTDevice {
   uint16_t attempt_{0};
   uint32_t block_i_{0};
   uint16_t resume_block_{0};
+  uint8_t hs_step_{0};            // krok handshake: 0,1=Start; 2,3,4=QInfo (jak IAPTool)
+  uint32_t handshake_end_ms_{0};  // twardy limit czasu handshake
 
   // bufor odbiorczy
   uint8_t rx_[300];
   uint16_t rx_len_{0};
+  bool rx_logged_{false};
 };
 
 }  // namespace inverter_iap

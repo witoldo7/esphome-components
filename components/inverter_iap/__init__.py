@@ -41,6 +41,7 @@ InverterIAP = inverter_iap_ns.class_("InverterIAP", cg.Component, uart.UARTDevic
 CONF_FIRMWARE = "firmware"
 CONF_OBJECT = "object"
 CONF_ALLOW_UPDATE = "allow_update"
+CONF_DEBUG = "debug"
 CONF_MODBUS_ID = "modbus_id"
 CONF_PROGRESS = "progress"
 CONF_STATUS = "status"
@@ -178,6 +179,7 @@ CONFIG_SCHEMA = (
             cv.Required(CONF_FIRMWARE): _validate_firmware,
             cv.Optional(CONF_OBJECT, default="app"): cv.enum(OBJECTS, lower=True),
             cv.Optional(CONF_ALLOW_UPDATE, default=False): cv.boolean,
+            cv.Optional(CONF_DEBUG, default=False): cv.boolean,
             cv.Optional(CONF_MODBUS_ID): cv.use_id(cg.Component),
             cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
             cv.Optional(CONF_PROGRESS): sensor.sensor_schema(
@@ -205,6 +207,7 @@ async def to_code(config):
     cg.add(var.set_address(config[CONF_ADDRESS]))
     cg.add(var.set_object(config[CONF_OBJECT]))
     cg.add(var.set_allow_update(config[CONF_ALLOW_UPDATE]))
+    cg.add(var.set_debug(config[CONF_DEBUG]))
 
     if CONF_MODBUS_ID in config:
         mb = await cg.get_variable(config[CONF_MODBUS_ID])

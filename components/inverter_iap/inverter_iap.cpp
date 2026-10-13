@@ -100,8 +100,20 @@ void InverterIAP::send_frame_(const uint8_t *buf, uint16_t len) {
     this->flush();  // czekaj na opróżnienie TX zanim opuścisz DE (RS485)
     this->flow_control_pin_->digital_write(false);
   }
+  if (this->debug_)
+    this->log_hex_("TX", buf, len);
   this->rx_len_ = 0;
   this->last_rx_ms_ = 0;
+  this->rx_logged_ = false;
+}
+
+void InverterIAP::log_hex_(const char *dir, const uint8_t *buf, uint16_t len) const {
+  char line[3 * 48 + 4];
+  uint16_t show = len > 48 ? 48 : len;
+  uint16_t p = 0;
+  for (uint16_t i = 0; i < show; i++)
+    p += snprintf(line + p, sizeof(line) - p, "%02X ", buf[i]);
+  ESP_LOGI(TAG, "%s (%u B): %s%s", dir, len, line, len > show ? "..." : "");
 }
 
 void InverterIAP::drain_rx_() {
@@ -184,6 +196,8 @@ void InverterIAP::start_update(bool query_only) {
     this->read_byte(&b);
   this->block_i_ = 0;
   this->resume_block_ = 0;
+  this->hs_step_ = 0;
+  this->handshake_end_ms_ = millis() + 30000;  // limit handshake ~30 s
   this->publish_progress_(0.0f);
   this->publish_status_(query_only ? "Test lacznosci..." : "Start aktualizacji...");
   ESP_LOGI(TAG, "%s (ID=%u, obszar=%s, blokow=%u, suma=0x%08X)",
@@ -219,18 +233,17 @@ void InverterIAP::loop() {
     return;
 
   this->drain_rx_();
+  if (this->debug_ && this->frame_ready_() && !this->rx_logged_) {
+    this->log_hex_("RX", this->rx_, this->rx_len_);
+    this->rx_logged_ = true;
+  }
   uint8_t f[300];
 
   switch (this->phase_) {
     case PH_ENTER: {
-      if (!this->req_sent_) {
-        uint16_t n = this->build_enter_(f);
-        this->send_frame_(f, n);
-        this->req_sent_ = true;
-        this->attempt_++;
-        this->phase_deadline_ms_ = millis() + 300;
-        return;
-      }
+      // Handshake jak w IAPTool (timer 1,5 s): cyklicznie Start,Start,QInfo,QInfo,QInfo
+      // aż do poprawnej odpowiedzi QueryInfo. Start ponawiany co cykl — urządzenie
+      // może nie wejść w bootloader za pierwszym razem.
       if (this->frame_ready_()) {
         if (this->rx_len_ >= 2 && this->rx_[1] == 0x90) {
           uint16_t t = this->rx_len_ >= 4 ? (this->rx_[2] << 8) | this->rx_[3] : 0;
@@ -239,28 +252,6 @@ void InverterIAP::loop() {
           this->fail_(buf);
           return;
         }
-        this->enter_phase_(PH_QUERY);  // jakakolwiek odpowiedz → dalej
-        return;
-      }
-      if (millis() >= this->phase_deadline_ms_) {
-        if (this->attempt_ >= 5)
-          this->enter_phase_(PH_QUERY);  // aplikacja mogla nie odpowiedziec — probuj QueryInfo
-        else
-          this->req_sent_ = false;
-      }
-      break;
-    }
-
-    case PH_QUERY: {
-      if (!this->req_sent_) {
-        uint16_t n = this->build_qinfo_(f);
-        this->send_frame_(f, n);
-        this->req_sent_ = true;
-        this->attempt_++;
-        this->phase_deadline_ms_ = millis() + 500;
-        return;
-      }
-      if (this->frame_ready_()) {
         if (this->resp_chk_ok_() && this->rx_len_ >= 24 && this->rx_[1] == 0x00) {
           uint8_t chip = this->rx_[4];
           uint8_t page = this->rx_[5];
@@ -303,13 +294,22 @@ void InverterIAP::loop() {
           }
           return;
         }
-        this->rx_len_ = 0;  // ramka niepoprawna — czekaj dalej
+        // inna/niepoprawna ramka — odrzuć i czekaj dalej w tym kroku
+        this->rx_len_ = 0;
+        this->rx_logged_ = false;
+      }
+      if (!this->req_sent_) {
+        uint16_t n = (this->hs_step_ < 2) ? this->build_enter_(f) : this->build_qinfo_(f);
+        this->send_frame_(f, n);
+        this->req_sent_ = true;
+        this->phase_deadline_ms_ = millis() + 1000;  // odstęp kroku (IAPTool: 1,5 s)
+        return;
       }
       if (millis() >= this->phase_deadline_ms_) {
-        if (this->attempt_ >= 10)
-          this->fail_("brak poprawnej odpowiedzi QueryInfo (sprawdz ID/okablowanie)");
-        else
-          this->req_sent_ = false;
+        this->hs_step_ = (this->hs_step_ + 1) % 5;  // Start,Start,QInfo,QInfo,QInfo,...
+        this->req_sent_ = false;
+        if (millis() >= this->handshake_end_ms_)
+          this->fail_("brak poprawnej odpowiedzi QueryInfo (sprawdz ID / okablowanie / standby)");
       }
       break;
     }
