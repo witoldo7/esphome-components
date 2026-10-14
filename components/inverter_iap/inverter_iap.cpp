@@ -173,6 +173,72 @@ void InverterIAP::finish_(const char *reason) {
     this->modbus_->enable_loop();
 }
 
+void InverterIAP::reject_(const char *reason) {
+  // odmowa jeszcze przed wejściem w bootloader — nic nie wysłano do IAP
+  ESP_LOGW(TAG, "Wgranie zablokowane: %s", reason);
+  this->publish_status_(std::string("ODMOWA: ") + reason);
+  this->phase_ = PH_IDLE;
+  if (this->modbus_ != nullptr)
+    this->modbus_->enable_loop();
+}
+
+int32_t InverterIAP::parse_fw_date_(const std::string &s) {
+  size_t p = s.find("B0");
+  if (p == std::string::npos || p + 8 > s.size())
+    return -1;
+  int32_t d = 0;
+  for (size_t i = p + 2; i < p + 8; i++) {
+    char ch = s[i];
+    if (ch < '0' || ch > '9')
+      return -1;
+    d = d * 10 + (ch - '0');
+  }
+  return d;
+}
+
+bool InverterIAP::read_device_version_(std::string &out) {
+  // Modbus RTU FC3: odczyt rej. 626 (0x0272), 8 słów ASCII (16 znaków)
+  uint8_t req[8] = {this->address_, 0x03, 0x02, 0x72, 0x00, 0x08, 0, 0};
+  uint16_t c = crc16_modbus_(req, 6);
+  req[6] = c & 0xFF;  // Modbus RTU: lo, hi
+  req[7] = (c >> 8) & 0xFF;
+  uint8_t b;
+  while (this->available())
+    this->read_byte(&b);
+  this->send_frame_(req, 8);
+
+  uint8_t resp[64];
+  uint16_t n = 0;
+  uint32_t t0 = millis();
+  while (millis() - t0 < 700) {  // jednorazowy odczyt na starcie — dopuszczalne krótkie oczekiwanie
+    while (this->available()) {
+      uint8_t x;
+      if (this->read_byte(&x) && n < sizeof(resp))
+        resp[n++] = x;
+    }
+    if (n >= 21)  // id+fc+bc(16)+crc = 21
+      break;
+  }
+  if (this->debug_)
+    this->log_hex_("RX626", resp, n);
+  if (n < 5 || resp[0] != this->address_ || resp[1] != 0x03)
+    return false;
+  uint8_t bc = resp[2];
+  if (bc < 2 || (uint16_t) (bc + 5) > n)
+    return false;
+  uint16_t cc = crc16_modbus_(resp, bc + 3);
+  if (resp[bc + 3] != (cc & 0xFF) || resp[bc + 4] != ((cc >> 8) & 0xFF))
+    return false;
+  std::string s;
+  for (uint8_t i = 0; i < bc; i++) {
+    char ch = (char) resp[3 + i];
+    if (ch >= 32 && ch < 127)
+      s += ch;
+  }
+  out = s;
+  return true;
+}
+
 // --- API publiczne ----------------------------------------------------------
 void InverterIAP::start_update(bool query_only) {
   if (this->fw_data_ == nullptr || this->fw_blocks_ == 0) {
@@ -194,6 +260,33 @@ void InverterIAP::start_update(bool query_only) {
   uint8_t b;
   while (this->available())
     this->read_byte(&b);
+
+  // --- bramka wersji: blokuj downgrade / tę samą wersję (chyba że force) ---
+  if (!query_only && this->allow_update_ && !this->force_) {
+    std::string dev;
+    bool ok = this->read_device_version_(dev);
+    int32_t devd = ok ? parse_fw_date_(dev) : -1;
+    int32_t filed = (int32_t) this->file_date_;
+    ESP_LOGI(TAG, "Kontrola wersji: urzadzenie='%s'(%ld) plik='%s'(%ld)", dev.c_str(), (long) devd,
+             this->file_version_.c_str(), (long) filed);
+    if (filed <= 0) {
+      this->reject_("brak 'file_version' w konfiguracji — nie moge porownac wersji (ustaw file_version albo wlacz 'force')");
+      return;
+    }
+    if (devd < 0) {
+      this->reject_("nie odczytano wersji urzadzenia (rej. 626, czy w trybie app?) — wlacz 'force'");
+      return;
+    }
+    if (filed <= devd) {
+      char buf[120];
+      snprintf(buf, sizeof(buf),
+               "plik (%ld) nie nowszy niz urzadzenie (%ld) — downgrade/ta sama wersja zablokowane (wlacz 'force')",
+               (long) filed, (long) devd);
+      this->reject_(buf);
+      return;
+    }
+  }
+
   this->block_i_ = 0;
   this->resume_block_ = 0;
   this->hs_step_ = 0;
@@ -238,6 +331,8 @@ void InverterIAP::dump_config() {
   ESP_LOGCONFIG(TAG, "  Adres Modbus: %u", this->address_);
   ESP_LOGCONFIG(TAG, "  Obszar: %s", this->object_ == 1 ? "Boot" : "App");
   ESP_LOGCONFIG(TAG, "  allow_update: %s", this->allow_update_ ? "TAK" : "NIE (tylko test lacznosci)");
+  ESP_LOGCONFIG(TAG, "  Wersja pliku: %s (data %u)", this->file_version_.c_str(), this->file_date_);
+  ESP_LOGCONFIG(TAG, "  force: %s", this->force_ ? "TAK (bramka wersji wylaczona)" : "NIE");
   ESP_LOGCONFIG(TAG, "  Blokow firmware: %u (po 128 slow / 256 B)", this->fw_blocks_);
   ESP_LOGCONFIG(TAG, "  Suma flash: 0x%08X", this->flash_sum_);
   ESP_LOGCONFIG(TAG, "  Modbus wstrzymywany: %s", this->modbus_ != nullptr ? "TAK" : "NIE");

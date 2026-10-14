@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <string>
+
 #include "esphome/core/component.h"
 #include "esphome/core/gpio.h"
 #include "esphome/components/uart/uart.h"
@@ -39,6 +42,12 @@ class InverterIAP : public Component, public uart::UARTDevice {
   void set_progress_sensor(sensor::Sensor *s) { this->progress_sensor_ = s; }
   void set_status_text_sensor(text_sensor::TextSensor *t) { this->status_text_sensor_ = t; }
   void set_debug(bool debug) { this->debug_ = debug; }
+  void set_force(bool force) { this->force_ = force; }
+  bool get_force() const { return this->force_; }
+  void set_file_version(const char *v, uint32_t date) {
+    this->file_version_ = v;
+    this->file_date_ = date;
+  }
   void set_firmware(const uint8_t *data, const uint32_t *addr, uint32_t blocks, uint32_t flash_sum) {
     this->fw_data_ = data;
     this->fw_addr_ = addr;
@@ -60,6 +69,10 @@ class InverterIAP : public Component, public uart::UARTDevice {
   void drain_rx_();
   bool frame_ready_() const;
   void log_hex_(const char *dir, const uint8_t *buf, uint16_t len) const;
+  // odczyt wersji firmware urządzenia (Modbus FC3, rej. 626) — przed wejściem w bootloader
+  bool read_device_version_(std::string &out);
+  static int32_t parse_fw_date_(const std::string &s);  // "2300_B0YYMMDDp1" -> YYMMDD albo -1
+  void reject_(const char *reason);                       // odmowa przed wejściem w bootloader
   static uint8_t pkt_chk_(const uint8_t *buf, uint16_t len);
   static uint16_t crc16_modbus_(const uint8_t *buf, uint16_t len);
   bool resp_chk_ok_() const;
@@ -82,7 +95,10 @@ class InverterIAP : public Component, public uart::UARTDevice {
   uint8_t address_{1};
   uint8_t object_{0};  // 0 = App, 1 = Boot
   bool allow_update_{false};
+  bool force_{false};
   bool debug_{false};
+  std::string file_version_;   // wersja z pliku (np. "2300_B0250924p1")
+  uint32_t file_date_{0};      // data z wersji pliku (YYMMDD) do porównania
   Component *modbus_{nullptr};
   GPIOPin *flow_control_pin_{nullptr};
   sensor::Sensor *progress_sensor_{nullptr};

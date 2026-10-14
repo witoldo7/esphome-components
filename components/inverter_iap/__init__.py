@@ -12,6 +12,7 @@ Falownik powinien być w trybie standby, bez obciążenia i bez AC/PV.
 """
 
 import base64
+import re
 import subprocess
 
 import esphome.codegen as cg
@@ -41,6 +42,8 @@ InverterIAP = inverter_iap_ns.class_("InverterIAP", cg.Component, uart.UARTDevic
 CONF_FIRMWARE = "firmware"
 CONF_OBJECT = "object"
 CONF_ALLOW_UPDATE = "allow_update"
+CONF_FORCE = "force"
+CONF_FILE_VERSION = "file_version"
 CONF_DEBUG = "debug"
 CONF_MODBUS_ID = "modbus_id"
 CONF_PROGRESS = "progress"
@@ -54,9 +57,26 @@ REGION_START = 0x3D8000
 REGION_END = 0x3F3FFF
 FLAG_ADDR = 0x3D8001
 FLAG_VALUE = 0x2300
+APP_MARKER = 0xBEAF  # bootloader wymaga go pod 0x3D8000 (start) i 0x3F3FFF (koniec)
 WORDS_PER_BLOCK = 128
 
 OBJECTS = {"app": 0, "boot": 1}
+
+
+def _extract_file_version(blob: bytes):
+    """Znajduje w obrazie ciąg wersji, np. '2300_B0250924p1'.
+
+    Na C28x `char` jest 16-bitowy, więc łańcuchy w kodzie są zapisane
+    jeden znak na słowo w MŁODSZYM bajcie (starszy = 0x00). `blob` jest w
+    kolejności hi,lo na słowo, więc znaki to młodsze bajty: blob[1::2].
+    Zwraca (napis, data_YYMMDD jako int) albo ('', 0).
+    """
+    pat = re.compile(rb"2300_B0(\d{6})[pP]\d")
+    for stream in (bytes(blob[1::2]), bytes(blob)):  # najpierw low-byte/słowo, potem ciągły
+        m = pat.search(stream)
+        if m:
+            return m.group(0).decode("latin-1"), int(m.group(1))
+    return "", 0
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +169,16 @@ def _load_firmware_bytes(raw: bytes, name: str):
             "firmware dla tego urządzenia."
             % (FLAG_ADDR, ("0x%04X" % got) if got is not None else "brak", FLAG_VALUE)
         )
+    # Znaczniki aplikacji, których wymaga bootloader do skoku do aplikacji
+    # (patrz wejście bootloadera @0x3F4000: sprawdza 0x3D8000 i 0x3F3FFF == 0xBEAF).
+    for addr, lbl in ((REGION_START, "start 0x3D8000"), (REGION_END, "koniec 0x3F3FFF")):
+        if words.get(addr) != APP_MARKER:
+            got = words.get(addr)
+            raise cv.Invalid(
+                "Brak znacznika aplikacji 0x%04X pod 0x%06X (%s): %s — bootloader nie uznałby "
+                "obrazu za zdatny; odmawiam wgrania (zły/niekompletny plik)."
+                % (APP_MARKER, addr, lbl, ("0x%04X" % got) if got is not None else "brak")
+            )
     blocks, flash_sum = _build_blocks(words)
     if not blocks:
         raise cv.Invalid("Obraz firmware nie zawiera danych w zakresie aplikacji.")
@@ -179,6 +209,8 @@ CONFIG_SCHEMA = (
             cv.Required(CONF_FIRMWARE): _validate_firmware,
             cv.Optional(CONF_OBJECT, default="app"): cv.enum(OBJECTS, lower=True),
             cv.Optional(CONF_ALLOW_UPDATE, default=False): cv.boolean,
+            cv.Optional(CONF_FORCE, default=False): cv.boolean,
+            cv.Optional(CONF_FILE_VERSION): cv.string,
             cv.Optional(CONF_DEBUG, default=False): cv.boolean,
             cv.Optional(CONF_MODBUS_ID): cv.use_id(cg.Component),
             cv.Optional(CONF_FLOW_CONTROL_PIN): pins.gpio_output_pin_schema,
@@ -207,6 +239,7 @@ async def to_code(config):
     cg.add(var.set_address(config[CONF_ADDRESS]))
     cg.add(var.set_object(config[CONF_OBJECT]))
     cg.add(var.set_allow_update(config[CONF_ALLOW_UPDATE]))
+    cg.add(var.set_force(config[CONF_FORCE]))
     cg.add(var.set_debug(config[CONF_DEBUG]))
 
     if CONF_MODBUS_ID in config:
@@ -243,6 +276,18 @@ async def to_code(config):
         for x in words:  # słowo: starszy bajt, potem młodszy (format pakietu Program)
             blob.append((x >> 8) & 0xFF)
             blob.append(x & 0xFF)
+
+    # wersja firmware z pliku (do bramki przed zapisem):
+    # priorytet ma jawnie podany file_version w configu; w razie braku — próba
+    # wydobycia z obrazu (zwykle brak, bo reg 626 budowany jest w locie przez aplikację).
+    file_version = config.get(CONF_FILE_VERSION, "")
+    file_date = 0
+    if file_version:
+        mm = re.search(r"B0(\d{6})", file_version)
+        file_date = int(mm.group(1)) if mm else 0
+    else:
+        file_version, file_date = _extract_file_version(blob)
+    cg.add(var.set_file_version(file_version, file_date))
 
     prefix = str(config[CONF_ID].id)
     data_name = prefix + "_fw_data"
