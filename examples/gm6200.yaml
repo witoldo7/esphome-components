@@ -125,30 +125,11 @@ inverter_iap:
     name: "${name} firmware update status"
 
 button:
-  # (akcja 'query' ukryta — do kontroli łączności/wersji służą sensory Modbus 171/201/626)
-  # Pełna aktualizacja — zablokowana, jeśli plik nie jest nowszy niż wersja urządzenia
-  # (downgrade / ta sama wersja) — chyba że włączony przełącznik "force update".
   - platform: inverter_iap
     inverter_iap_id: iap
     action: update
     name: "${name} firmware update"
     icon: mdi:cloud-upload
-    entity_category: config
-  # Przerwij trwającą aktualizację. internal: true → NIE jest wystawiany do Home Assistant
-  # (dostępny tylko dla automatyzacji ESPHome; przerwanie w trakcie Program bywa ryzykowne).
-  - platform: inverter_iap
-    inverter_iap_id: iap
-    action: abort
-    name: "${name} firmware update abort"
-    icon: mdi:cancel
-    internal: true
-  # Reset do aplikacji: czysty 0x05 — wyprowadza falownik z bootloadera bez flashowania
-  # (awaryjnie, gdy utknął w bootloaderze po teście/przerwaniu).
-  - platform: inverter_iap
-    inverter_iap_id: iap
-    action: reset
-    name: "${name} firmware reset to app"
-    icon: mdi:restart
     entity_category: config
 
 time:
